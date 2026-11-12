@@ -1,4 +1,10 @@
-"""Water balance, chain feasibility, and optional hard terminal reachability."""
+"""Water balance, chain feasibility and a non-anticipative terminal schedule.
+
+The terminal-storage objective is enforced with a rolling release window built
+only from information available at the decision time: current storage, today's
+realised inflow, the remaining number of decisions, the terminal target and the
+supplied next-seven-day mean inflow forecast. No future observed inflow is read.
+"""
 import numpy as np
 from harl.envs.cascade_reservoir.data_loader import HEAD_MODELS
 
@@ -7,104 +13,43 @@ class InfeasibleCascade(RuntimeError):
     pass
 
 
-def close_storage_constraints(constraints):
-    """Close difference bounds on [0, V0, V0+V1, ..., sum(V)].
+TERMINAL_TOLERANCE = 1e-8
 
-    Entry (i,j) bounds prefix[i]-prefix[j]. Leading batch axes are allowed.
-    A closed matrix describes exact projections, including coupled storage
-    restrictions which cannot be represented by five independent intervals.
+
+def terminal_inputs(terminal):
+    """Validate one decision's terminal-scheduling inputs."""
+    try:
+        target = np.asarray(terminal['target'], dtype=np.float64)
+        raw_days = np.asarray(terminal['remaining_days'])
+        forecast = np.asarray(terminal['forecast'], dtype=np.float64)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError('terminal requires target, remaining_days and forecast') from exc
+    if (target.shape != (5,) or forecast.shape != (5,) or
+            not np.isfinite(target).all() or not np.isfinite(forecast).all()):
+        raise ValueError('Terminal target and forecast must be finite five-vectors')
+    if (forecast < 0.).any():
+        raise ValueError('Terminal forecast inflow must be nonnegative')
+    if (raw_days.shape != () or not np.isfinite(raw_days) or raw_days < 1 or
+            raw_days != np.floor(raw_days)):
+        raise ValueError('Terminal scheduling requires a positive integer remaining horizon')
+    days = int(raw_days)
+    return target, days, forecast
+
+
+def terminal_release_window(dt, storage, inflow, target, remaining_days, forecast, capacity):
+    """Today's release window that keeps the terminal target attainable.
+
+    Reaching the target after the remaining decisions requires a total release
+    volume of V + dt*inflow + dt*(days-1)*forecast - target. Only the part that
+    can still be released over the remaining days may be deferred, which gives
+    the window [required - (days-1)*capacity, required]. On the final day the
+    window collapses to the exact release required by the water balance.
     """
-    bounds = np.asarray(constraints, dtype=np.float64).copy()
-    if bounds.shape[-2:] != (6, 6) or np.isnan(bounds).any():
-        raise ValueError('Storage constraints require six by six difference bounds')
-    for k in range(6):
-        candidate = bounds[..., :, k, None]+bounds[..., None, k, :]
-        # Do not amplify cancellation at large cumulative storages into
-        # artificial negative cycles when fixing successive coordinates.
-        np.copyto(bounds, candidate, where=candidate < bounds-1e-4)
-        if (np.diagonal(bounds, axis1=-2, axis2=-1) < -1e-3).any():
-            raise InfeasibleCascade('No trajectory can satisfy the terminal storage requirement')
-        bounds[..., np.arange(6), np.arange(6)] = 0.
-    return bounds
-
-
-def _storage_box_constraints(lower, upper):
-    lower, upper = np.asarray(lower), np.asarray(upper)
-    bounds = np.full(lower.shape[:-1]+(6, 6), np.inf)
-    bounds[..., np.arange(6), np.arange(6)] = 0.
-    for i in range(5):
-        bounds[..., i+1, i], bounds[..., i, i+1] = upper[..., i], -lower[..., i]
-    return close_storage_constraints(bounds)
-
-
-def terminal_storage_constraints(data, external, storage_lower, storage_upper, target, dt):
-    """Exact backward reachability to the episode's initial storage.
-
-    The known episode hydrology is used by the physical feasibility filter,
-    not added to policy observations. No annual targets or storage resets are
-    introduced. In cumulative storage, each outlet controls one coordinate:
-    X'[i] = X[i] + dt * (sum(external[:i]) - release[i-1]).
-    Backward projection and intersection with each day's envelope remain
-    difference-bound sets, so every online command has a feasible completion.
-    """
-    target = np.asarray(target, dtype=np.float64)
-    lower, upper = np.asarray(storage_lower), np.asarray(storage_upper)
-    flows = np.asarray(external, dtype=np.float64)
-    if (target.shape != (5,) or flows.ndim != 2 or flows.shape[1] != 5 or
-            lower.shape != flows.shape or upper.shape != flows.shape or
-            not all(np.isfinite(x).all() for x in (target, flows, lower, upper))):
-        raise ValueError('Invalid terminal-storage planning inputs')
-    if (target < lower[-1]).any() or (target > upper[-1]).any():
-        raise InfeasibleCascade('Initial storage is outside the final-day permitted envelope')
-    planned = np.empty((len(flows), 6, 6), dtype=np.float64)
-    zone = _storage_box_constraints(target, target)
-    for t in reversed(range(len(flows))):
-        zone = close_storage_constraints(np.minimum(zone, _storage_box_constraints(lower[t], upper[t])))
-        planned[t] = zone
-        incoming = np.r_[0., np.cumsum(flows[t])*dt]
-        minimum_change = incoming-np.r_[0., data.release_cap*dt]
-        zone = zone-minimum_change[:, None]+incoming[None, :]
-        np.fill_diagonal(zone, 0.)
-    prefix = np.r_[0., np.cumsum(target)]
-    if (prefix[:, None]-prefix[None, :] > zone+1e-3).any():
-        raise InfeasibleCascade('Initial storage cannot reach the required terminal storage')
-    planned.setflags(write=False)
-    return planned
-
-
-def constrained_releases(data, dt, storage, external, actions, constraints):
-    """Choose releases from an exact reachable zone; supports batch axes."""
-    shape = storage.shape
-    bounds = np.asarray(constraints, dtype=np.float64)
-    if bounds.shape not in ((6, 6), shape[:-1]+(6, 6)) or not np.isfinite(bounds).all():
-        raise ValueError('Storage constraints must be finite matching six by six matrices')
-    bounds = np.broadcast_to(bounds, shape[:-1]+(6, 6)).copy()
-    prefix = np.concatenate((np.zeros(shape[:-1]+(1,)), np.cumsum(storage, axis=-1)), axis=-1)
-    incoming = np.concatenate((np.zeros(shape[:-1]+(1,)), np.cumsum(external, axis=-1)*dt), axis=-1)
-    maximum = prefix+incoming
-    minimum = maximum-np.r_[0., data.release_cap*dt]
-    bounds[..., :, 0] = np.minimum(bounds[..., :, 0], maximum)
-    bounds[..., 0, :] = np.minimum(bounds[..., 0, :], -minimum)
-    bounds = close_storage_constraints(bounds)
-    inflow, release, low, high = [np.empty(shape, dtype=np.float64) for _ in range(4)]
-    controls, executed = np.ones(shape, dtype=np.float32), actions.copy()
-    for i in range(5):
-        low[..., i] = np.maximum(0., (maximum[..., i+1]-bounds[..., i+1, 0])/dt)
-        high[..., i] = np.minimum(data.release_cap[i], (maximum[..., i+1]+bounds[..., 0, i+1])/dt)
-        if (low[..., i] > high[..., i]+1e-8).any():
-            raise InfeasibleCascade('Empty terminal-compatible release interval')
-        forced = high[..., i]-low[..., i] <= 1e-8
-        controls[..., i] = np.where(forced, 0., 1.)
-        executed[..., i] = np.where(forced, .5, executed[..., i])
-        midpoint = np.minimum(data.release_cap[i], np.maximum(0., .5*(low[..., i]+high[..., i])))
-        release[..., i] = np.where(forced, midpoint,
-            low[..., i]+executed[..., i]**2*(high[..., i]-low[..., i]))
-        inflow[..., i] = external[..., i]+(release[..., i-1] if i else 0.)
-        selected = maximum[..., i+1]-release[..., i]*dt
-        bounds[..., i+1, 0] = np.minimum(bounds[..., i+1, 0], selected)
-        bounds[..., 0, i+1] = np.minimum(bounds[..., 0, i+1], -selected)
-        bounds = close_storage_constraints(bounds)
-    return inflow, release, low, high, controls, executed
+    future = (int(remaining_days)-1 if np.ndim(remaining_days) == 0 else
+              np.asarray(remaining_days, dtype=np.int64)-1)
+    required = storage+dt*inflow+dt*future*np.maximum(0., forecast)-target
+    upper = required/dt
+    return upper-future*capacity, upper
 
 
 class ReservoirPhysics:
@@ -209,15 +154,15 @@ class ReservoirPhysics:
         return lo, hi
 
     def transition(self, storage, external, actions, storage_lower=None, storage_upper=None,
-                   storage_constraints=None):
-        """Apply one action using only current inflow and its next-state bounds.
+                   terminal=None):
+        """Apply one action using only information available at decision time.
 
-        Bounds constrain storage after this action. Optional cumulative-storage
-        constraints also preserve reachability of the episode terminal target.
-        Starting storage can exceed
-        the next-state ceiling; it is checked against the preceding action's
-        bounds by the environment. Future hydrology is read only when the
-        environment constructs its optional terminal reachability constraints.
+        Bounds constrain storage after this action. Optional terminal scheduling
+        inputs (target, remaining decisions and the supplied seven-day inflow
+        forecast) shrink each release interval so the terminal target stays
+        attainable. The final decision collapses to the exact water-balance
+        release. An empty intersection executes the nearest admissible release
+        and is reported; storage is never overwritten to satisfy the target.
         """
         storage, external, actions = [np.asarray(x, dtype=np.float64) for x in (storage, external, actions)]
         if any(x.shape != (5,) or not np.isfinite(x).all() for x in (storage, external, actions)):
@@ -231,12 +176,35 @@ class ReservoirPhysics:
         lower, upper = self.downstream_intervals(storage, external, storage_min, storage_max)
         inflow, release, low, high = [np.empty(5) for _ in range(4)]
         controls, executed_actions = np.ones(5, dtype=np.float32), actions.copy()
-        for i in range(5) if storage_constraints is None else ():
+        target = days = forecast = None
+        window_low, window_high = np.full(5, -np.inf), np.full(5, np.inf)
+        binding, infeasible = np.zeros(5, dtype=bool), np.zeros(5, dtype=bool)
+        reason = np.zeros(5, dtype=np.int8)
+        if terminal is not None:
+            target, days, forecast = terminal_inputs(terminal)
+        for i in range(5):
             inflow[i] = external[i] + (release[i - 1] if i else 0.)
             low[i] = max(lower[i], inflow[i] + (storage[i] - storage_max[i]) / self.dt)
             high[i] = min(upper[i], inflow[i] + (storage[i] - storage_min[i]) / self.dt)
             if low[i] > high[i] + 1e-8:
                 raise InfeasibleCascade("Empty feasible release interval at reservoir " + str(i))
+            if terminal is not None:
+                window_low[i], window_high[i] = terminal_release_window(
+                    self.dt, storage[i], inflow[i], target[i], days, forecast[i],
+                    d.release_cap[i])
+                planned_low = max(low[i], window_low[i])
+                planned_high = min(high[i], window_high[i])
+                if planned_low > planned_high + TERMINAL_TOLERANCE:
+                    infeasible[i] = True
+                    reason[i] = 1 if window_low[i] > high[i] + TERMINAL_TOLERANCE else 2
+                    release[i] = float(np.clip(0.5 * (window_low[i] + window_high[i]),
+                                               low[i], high[i]))
+                    controls[i] = 0
+                    executed_actions[i] = 0.5
+                    continue
+                binding[i] = (planned_low > low[i] + TERMINAL_TOLERANCE or
+                              planned_high < high[i] - TERMINAL_TOLERANCE)
+                low[i], high[i] = planned_low, planned_high
             if high[i] - low[i] <= 1e-8:
                 controls[i] = 0
                 executed_actions[i] = 0.5
@@ -246,10 +214,6 @@ class ReservoirPhysics:
                 release[i] = min(d.release_cap[i], max(0., 0.5 * (low[i] + high[i])))
             else:
                 release[i] = low[i] + executed_actions[i] ** 2 * (high[i] - low[i])
-        if storage_constraints is not None:
-            combined = np.minimum(storage_constraints, _storage_box_constraints(storage_min, storage_max))
-            inflow, release, low, high, controls, executed_actions = constrained_releases(
-                d, self.dt, storage, external, actions, combined)
         next_storage = storage + (inflow - release) * self.dt
         residual = next_storage - storage - (inflow - release) * self.dt
         tolerance = np.maximum(1., 1e-10 * np.abs(storage))
@@ -271,6 +235,11 @@ class ReservoirPhysics:
                     system_residual=float(system_residual), **generated)
         if storage_lower is not None:
             result.update(storage_lower_m3=storage_min.copy(), storage_upper_m3=storage_max.copy())
-        if storage_constraints is not None:
-            result['storage_constraints'] = np.asarray(storage_constraints).copy()
+        if terminal is not None:
+            result.update(terminal_target=target.copy(), terminal_remaining_days=days,
+                terminal_forecast=forecast.copy(), terminal_window_low_m3s=window_low.copy(),
+                terminal_window_high_m3s=window_high.copy(), terminal_window_binding=binding.copy(),
+                terminal_window_infeasible=infeasible.copy(), terminal_window_reason=reason.copy(),
+                terminal=dict(target=target.copy(), remaining_days=days,
+                              forecast=forecast.copy()))
         return result

@@ -52,12 +52,13 @@ after action t; no extra date shift is applied. Previous executed bounds constra
 the current state, including across source-year joins.
 
 `terminal_storage_equal_initial: true` requires every reservoir to finish the
-full episode at its own episode-start storage. Backward reachability uses known
-scenario inflows, outlet capacities and daily storage envelopes. Coupled
-cumulative-storage bounds keep this target reachable while commands are executed.
-There are no intervening annual equality targets or storage resets. Final storage
-is calculated from releases and water balance and checked within numerical
-water-accounting tolerance; it is never overwritten to meet the target.
+full episode at its own episode-start storage. Each decision uses a rolling
+release window built only from current storage, today's realised inflow, the
+remaining horizon, daily bounds, outlet capacities and the supplied next-seven-day
+mean inflow forecast. The final decision applies the exact water-balance release
+when physical constraints permit it. Forecast error or an empty physical window is
+reported with the resulting terminal storage deviation; storage is never
+overwritten to meet the target.
 
 Actor observations contain local and immediate-neighbor storage, current inflow,
 yesterday's release, downstream headroom, calendar/time features and daily bounds.
@@ -77,7 +78,7 @@ release = feasible_low + u² * (feasible_high - feasible_low)
 ```
 
 Feasible release intervals enforce storage bounds, outlet capacities,
-downstream compatibility and terminal reachability. Physically forced intervals
+downstream compatibility and the rolling terminal-storage window. Physically forced intervals
 mask actor learning and contribute a unit HAPPO correction factor. The default
 100-command grid can be changed with `--action-bins`.
 
@@ -200,7 +201,7 @@ deficits, learning returns, spill and final storage without fitting models.
 
 `analysis/dispatch_diagnostics/` reconstructs frozen trajectories and tests
 same-state ecological release alternatives through the full cascade. Grid and
-continuous witnesses retain terminal constraints. These are separate same-day
+continuous witnesses retain terminal scheduling inputs. These are separate same-day
 comparisons, not an executable multi-day intervention or evidence of optimality.
 
 ## Source map

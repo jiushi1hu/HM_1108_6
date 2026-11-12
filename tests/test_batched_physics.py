@@ -20,7 +20,7 @@ from test_dispatch_feasibility import synthetic_dispatch
 
 class BatchedPhysicsTest(unittest.TestCase):
     def assert_scalar_equivalent(self, physics, storage, external, actions, lower=None, upper=None,
-                                 constraints=None):
+                                 terminal=None):
         storage, external, actions = [np.asarray(value, dtype=np.float64)
                                       for value in (storage, external, actions)]
         copies = [value.copy() for value in (storage, external, actions)]
@@ -31,15 +31,20 @@ class BatchedPhysicsTest(unittest.TestCase):
             lower.setflags(write=False)
             upper.setflags(write=False)
         rng = np.random.get_state()
-        options = {} if constraints is None else dict(storage_constraints=constraints)
+        options = {} if terminal is None else dict(terminal=terminal)
         actual = batched_transition(physics, storage, external, actions, lower, upper, **options)
         expected = []
         for i in range(len(storage)):
             bounds = {} if lower is None else dict(
                 storage_lower=lower if lower.ndim == 1 else lower[i],
                 storage_upper=upper if upper.ndim == 1 else upper[i])
-            if constraints is not None:
-                bounds['storage_constraints'] = constraints if constraints.ndim == 2 else constraints[i]
+            if terminal is not None:
+                bounds['terminal'] = dict(
+                    target=terminal['target'] if np.ndim(terminal['target']) == 1 else terminal['target'][i],
+                    remaining_days=(terminal['remaining_days'] if np.ndim(terminal['remaining_days']) == 0
+                                    else terminal['remaining_days'][i]),
+                    forecast=(terminal['forecast'] if np.ndim(terminal['forecast']) == 1
+                              else terminal['forecast'][i]))
             expected.append(physics.transition(storage[i], external[i], actions[i], **bounds))
         self.assertEqual(set(actual), set(expected[0]))
         for name in actual:
@@ -47,7 +52,13 @@ class BatchedPhysicsTest(unittest.TestCase):
             # equality rather than an engineering tolerance that could hide a
             # capacity, endpoint or routing discrepancy.
             with self.subTest(field=name):
-                np.testing.assert_array_equal(actual[name], np.asarray([row[name] for row in expected]))
+                if name == 'terminal':
+                    for key in actual[name]:
+                        np.testing.assert_array_equal(actual[name][key],
+                            np.asarray([row[name][key] for row in expected]))
+                else:
+                    np.testing.assert_array_equal(actual[name],
+                        np.asarray([row[name] for row in expected]))
         for original, unchanged in zip((storage, external, actions), copies):
             np.testing.assert_array_equal(original, unchanged)
         after = np.random.get_state()
@@ -73,9 +84,14 @@ class BatchedPhysicsTest(unittest.TestCase):
                     candidates[i*100:(i+1)*100, i] = grid
                 arrays = [np.repeat(row[name][None], 500, axis=0)
                           for name in ('storage_start', 'external', 'storage_lower_m3', 'storage_upper_m3')]
+                terminal = None
+                if row.get('terminal_target') is not None:
+                    terminal = dict(target=np.repeat(row['terminal_target'][None], 500, axis=0),
+                        remaining_days=np.full(500, row['terminal_remaining_days'], dtype=np.int64),
+                        forecast=np.repeat(row['terminal_forecast'][None], 500, axis=0))
                 with self.subTest(head=head_model, date=row['date']):
                     self.assert_scalar_equivalent(env.physics, arrays[0], arrays[1], candidates,
-                                                  arrays[2], arrays[3], row.get('storage_constraints'))
+                                                  arrays[2], arrays[3], terminal)
 
     def test_forced_intervals_and_downstream_control_changes(self):
         for head_model in ('fixed', 'storage_sensitivity'):

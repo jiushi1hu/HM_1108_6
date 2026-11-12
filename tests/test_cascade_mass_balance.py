@@ -98,8 +98,12 @@ class CascadeMassBalanceTest(unittest.TestCase):
                     self.assertTrue(np.any(row['storage_upper_m3'] > row['storage_lower_m3']))
                     if env.data.dates[step].year != env.data.dates[step+1].year:
                         intermediate_year_end_errors.append(float(np.abs(env.storage-initial).max()))
-            np.testing.assert_allclose(env.storage, initial, rtol=0., atol=1e-3)
-            np.testing.assert_array_equal(env.last_transition['controls'], np.zeros(5))
+            self.assertIsNotNone(env.terminal_report)
+            np.testing.assert_allclose(env.terminal_report['deviation_m3'],
+                                       env.storage-initial, rtol=0., atol=1e-6)
+            self.assertEqual(env.terminal_report['met'], bool(np.all(
+                np.abs(env.storage-initial) <= env.terminal_report['tolerance_m3'])))
+            self.assertFalse(env.terminal_report['storage_overwritten'])
             self.assertEqual(len(intermediate_year_end_errors), 4)
             self.assertTrue(all(error > 1. for error in intermediate_year_end_errors))
             env.reset()
@@ -113,9 +117,12 @@ class CascadeMassBalanceTest(unittest.TestCase):
         env = episode_environment(data, physical, [1965], days=5)
         for _ in range(5):
             env.step(np.full(5, 99))
-        np.testing.assert_allclose(env.storage, env.initial_storage, rtol=0., atol=1e-3)
-        np.testing.assert_array_equal(env.last_transition['storage_lower_m3'], env.initial_storage)
-        np.testing.assert_array_equal(env.last_transition['storage_upper_m3'], env.initial_storage)
+        self.assertIsNotNone(env.terminal_report)
+        np.testing.assert_allclose(env.terminal_report['deviation_m3'],
+                                   env.storage-env.initial_storage, rtol=0., atol=1e-6)
+        self.assertEqual(env.terminal_report['met'], bool(np.all(
+            np.abs(env.storage-env.initial_storage) <= env.terminal_report['tolerance_m3'])))
+        self.assertFalse(env.terminal_report['storage_overwritten'])
 
     def check_day(self, condition, reason, context):
         if not condition:

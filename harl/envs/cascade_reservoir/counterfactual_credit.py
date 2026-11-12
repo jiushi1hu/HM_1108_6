@@ -144,10 +144,19 @@ def compute_counterfactual_credit(physics, operation_reward, critic, value_norma
     if (span <= 0.).any() or (caps <= 0.).any():
         raise ValueError('Storage spans and release capacities must be positive')
     rows = time*lanes
-    storage_constraints = context.get('storage_constraints')
-    if storage_constraints is not None:
-        storage_constraints = _finite_array(storage_constraints,
-            (time, lanes, 6, 6), 'storage_constraints').reshape(-1, 6, 6)
+    terminal_names = ('terminal_target', 'terminal_remaining_days', 'terminal_forecast')
+    present = [name in context for name in terminal_names]
+    if any(present) and not all(present):
+        raise ValueError('Counterfactual terminal context requires target, remaining days and forecast')
+    terminal = None
+    if all(present):
+        terminal = dict(
+            target=_finite_array(context['terminal_target'],
+                (time, lanes, agents), 'terminal_target').reshape(-1, agents),
+            remaining_days=_finite_array(context['terminal_remaining_days'],
+                (time, lanes), 'terminal_remaining_days').reshape(-1),
+            forecast=_finite_array(context['terminal_forecast'],
+                (time, lanes, agents), 'terminal_forecast').reshape(-1, agents))
     total = rows*agents*bins
     q_flat = np.empty(total, dtype=np.float64)
     predict = getattr(critic, 'get_values', critic)
@@ -159,8 +168,9 @@ def compute_counterfactual_credit(physics, operation_reward, critic, value_norma
         command = indices % bins
         normalized = actions[row].astype(np.float64)/(bins-1)
         normalized[np.arange(len(indices)), actor] = command/(bins-1)
-        options = ({} if storage_constraints is None else
-                   dict(storage_constraints=storage_constraints[row]))
+        options = {} if terminal is None else dict(terminal=dict(
+            target=terminal['target'][row], remaining_days=terminal['remaining_days'][row],
+            forecast=terminal['forecast'][row]))
         dispatch = batched_transition(physics, values['storage_start'][row], values['external'][row],
             normalized, values['storage_lower'][row], values['storage_upper'][row], **options)
         q = system_rewards_from_dispatch(operation_reward, dispatch)

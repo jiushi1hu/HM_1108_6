@@ -2,14 +2,14 @@
 
 The live environment still uses ``ReservoirPhysics.transition``. This kernel
 adds only a leading batch dimension and never advances an environment or
-changes its inputs. The backward compatibility pass, forward execution,
-generation formulas and numerical tolerances match the scalar implementation.
+changes its inputs. The rolling terminal window, forward execution, generation
+formulas and numerical tolerances match the scalar implementation.
 """
 import numpy as np
 
 from harl.envs.cascade_reservoir.data_loader import IDS
 from harl.envs.cascade_reservoir.reservoir_physics import (
-    InfeasibleCascade, constrained_releases, _storage_box_constraints)
+    InfeasibleCascade, TERMINAL_TOLERANCE, terminal_release_window)
 
 
 def _matrix(value, name, shape=None):
@@ -55,15 +55,47 @@ def _forebay_levels(physics, storage):
     return levels
 
 
+def _terminal_inputs(terminal, shape):
+    """Broadcast the scalar terminal scheduling inputs over independent rows."""
+    if terminal is None:
+        return None
+    try:
+        target = np.asarray(terminal['target'], dtype=np.float64)
+        days = np.asarray(terminal['remaining_days'], dtype=np.float64)
+        forecast = np.asarray(terminal['forecast'], dtype=np.float64)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError('terminal requires target, remaining_days and forecast') from exc
+    days_shape = shape[:-1]
+    if target.shape not in ((len(IDS),), shape):
+        raise ValueError('terminal target must be a five-vector or matching batch')
+    if forecast.shape not in ((len(IDS),), shape):
+        raise ValueError('terminal forecast must be a five-vector or matching batch')
+    if days.shape == (1,):
+        days = days[0]
+    if days.ndim == 0:
+        days = np.broadcast_to(days, days_shape)
+    elif days.shape != days_shape:
+        raise ValueError('terminal remaining_days must be scalar or match the batch')
+    if (not np.isfinite(target).all() or not np.isfinite(forecast).all() or
+            not np.isfinite(days).all() or (forecast < 0.).any()):
+        raise ValueError('Terminal target, forecast and remaining days must be finite')
+    if (days < 1).any() or not np.equal(days, np.floor(days)).all():
+        raise ValueError('Terminal scheduling requires positive integer remaining days')
+    return (np.broadcast_to(target, shape), np.broadcast_to(days, days_shape).astype(np.int64),
+            np.broadcast_to(forecast, shape))
+
+
 def batched_transition(physics, storage, external, actions,
-                       storage_lower=None, storage_upper=None, storage_constraints=None):
+                       storage_lower=None, storage_upper=None, terminal=None):
     """Evaluate normalized-command transitions with input shape ``(batch, 5)``.
 
     Optional end-state bounds have that shape or are broadcast five-vectors.
     Result vectors have shape ``(batch, 5)``; generation rewards and cascade
     residuals have shape ``(batch,)``. A failed row raises for the entire batch.
     Empty batches are allowed. As in scalar physics, the returned ``reward`` is
-    unpenalized generation; the caller applies operation-reward settings.
+    unpenalized generation; the caller applies operation-reward settings. The
+    optional terminal scheduling inputs are broadcast over the batch and use
+    only the same-day inflow and supplied forecast.
     """
     storage = _matrix(storage, 'Storage')
     shape = storage.shape
@@ -75,6 +107,7 @@ def batched_transition(physics, storage, external, actions,
     storage_min, storage_max = _bounds(physics, shape, storage_lower, storage_upper)
     if ((storage < data.vmin-1.) | (storage > data.vmax+1.)).any():
         raise InfeasibleCascade('Starting storage violates operating bounds')
+    terminal_values = _terminal_inputs(terminal, shape)
 
     lower = np.zeros(shape, dtype=np.float64)
     upper = np.broadcast_to(data.release_cap, shape).copy()
@@ -89,26 +122,49 @@ def batched_transition(physics, storage, external, actions,
     inflow, release, low, high = [np.empty(shape, dtype=np.float64) for _ in range(4)]
     controls = np.ones(shape, dtype=np.float32)
     executed_actions = actions.copy()
-    for i in range(len(IDS)) if storage_constraints is None else ():
+    window_low = np.full(shape, -np.inf, dtype=np.float64)
+    window_high = np.full(shape, np.inf, dtype=np.float64)
+    binding = np.zeros(shape, dtype=bool)
+    infeasible = np.zeros(shape, dtype=bool)
+    reason = np.zeros(shape, dtype=np.int8)
+    for i in range(len(IDS)):
         inflow[:, i] = external[:, i]+(release[:, i-1] if i else 0.)
-        low[:, i] = np.maximum(lower[:, i], inflow[:, i]+(storage[:, i]-storage_max[:, i])/dt)
-        high[:, i] = np.minimum(upper[:, i], inflow[:, i]+(storage[:, i]-storage_min[:, i])/dt)
+        physical_low = np.maximum(lower[:, i], inflow[:, i]+(storage[:, i]-storage_max[:, i])/dt)
+        physical_high = np.minimum(upper[:, i], inflow[:, i]+(storage[:, i]-storage_min[:, i])/dt)
+        low[:, i], high[:, i] = physical_low, physical_high
         if (low[:, i] > high[:, i]+1e-8).any():
             raise InfeasibleCascade('Empty feasible release interval at reservoir '+str(i))
-        forced = high[:, i]-low[:, i] <= 1e-8
-        controls[forced, i] = 0.
-        executed_actions[forced, i] = .5
+        if terminal_values is not None:
+            target, days, forecast = terminal_values
+            window_low[:, i], window_high[:, i] = terminal_release_window(
+                dt, storage[:, i], inflow[:, i], target[:, i], days,
+                forecast[:, i], data.release_cap[i])
+            planned_low = np.maximum(low[:, i], window_low[:, i])
+            planned_high = np.minimum(high[:, i], window_high[:, i])
+            bad = planned_low > planned_high+TERMINAL_TOLERANCE
+            infeasible[:, i] = bad
+            reason[:, i] = np.where(bad,
+                np.where(window_low[:, i] > high[:, i]+TERMINAL_TOLERANCE, 1, 2), 0)
+            binding[:, i] = ((planned_low > low[:, i]+TERMINAL_TOLERANCE) |
+                             (planned_high < high[:, i]-TERMINAL_TOLERANCE)) & ~bad
+            low[:, i] = np.where(bad, physical_low, planned_low)
+            high[:, i] = np.where(bad, physical_high, planned_high)
+            terminal_midpoint = np.clip(0.5*(window_low[:, i]+window_high[:, i]),
+                                        physical_low, physical_high)
+        else:
+            bad = np.zeros(shape[:-1], dtype=bool)
+            terminal_midpoint = None
+        forced = ~bad & (high[:, i]-low[:, i] <= 1e-8)
+        uncontrolled = bad | forced
+        controls[uncontrolled, i] = 0.
+        executed_actions[uncontrolled, i] = .5
         midpoint = np.minimum(data.release_cap[i], np.maximum(0., .5*(low[:, i]+high[:, i])))
-        release[:, i] = np.where(forced, midpoint,
-            low[:, i]+executed_actions[:, i]**2*(high[:, i]-low[:, i]))
-
-    if storage_constraints is not None:
-        # Intersect arbitrary caller-supplied boxes as well as the reachable
-        # zone, just as scalar transition does. Each adjacent prefix difference
-        # is one reservoir's storage.
-        combined = np.minimum(storage_constraints, _storage_box_constraints(storage_min, storage_max))
-        inflow, release, low, high, controls, executed_actions = constrained_releases(
-            data, dt, storage, external, actions, combined)
+        regular = low[:, i]+executed_actions[:, i]**2*(high[:, i]-low[:, i])
+        if terminal_midpoint is None:
+            release[:, i] = np.where(forced, midpoint, regular)
+        else:
+            release[:, i] = np.where(bad, terminal_midpoint,
+                np.where(forced, midpoint, regular))
     next_storage = storage+(inflow-release)*dt
     residual = next_storage-storage-(inflow-release)*dt
     tolerance = np.maximum(1., 1e-10*np.abs(storage))
@@ -153,6 +209,12 @@ def batched_transition(physics, storage, external, actions,
         reward=energy.sum(axis=1)/physics.reference_energy, system_residual=system_residual)
     if storage_lower is not None:
         result.update(storage_lower_m3=storage_min.copy(), storage_upper_m3=storage_max.copy())
-    if storage_constraints is not None:
-        result['storage_constraints'] = np.broadcast_to(storage_constraints, shape[:-1]+(6, 6)).copy()
+    if terminal_values is not None:
+        target, days, forecast = terminal_values
+        result.update(terminal_target=target.copy(), terminal_remaining_days=days.copy(),
+            terminal_forecast=forecast.copy(), terminal_window_low_m3s=window_low.copy(),
+            terminal_window_high_m3s=window_high.copy(), terminal_window_binding=binding.copy(),
+            terminal_window_infeasible=infeasible.copy(), terminal_window_reason=reason.copy(),
+            terminal=dict(target=target.copy(), remaining_days=days.copy(),
+                          forecast=forecast.copy()))
     return result

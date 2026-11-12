@@ -295,8 +295,12 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             self.counterfactual_context['dates'] = np.empty(shape[:2], dtype=object)
             self.counterfactual_context['episode_ids'] = ids
             if self.physical_config.get('terminal_storage_equal_initial', False):
-                self.counterfactual_context['storage_constraints'] = np.empty(
-                    shape[:2]+(6, 6), dtype=np.float64)
+                self.counterfactual_context['terminal_target'] = np.empty(
+                    shape[:2]+(self.num_agents,), dtype=np.float64)
+                self.counterfactual_context['terminal_remaining_days'] = np.empty(
+                    shape[:2], dtype=np.int64)
+                self.counterfactual_context['terminal_forecast'] = np.empty(
+                    shape[:2]+(self.num_agents,), dtype=np.float64)
             self.counterfactual_probabilities = np.empty(shape+(self.action_bins,), dtype=np.float32)
         if self.trajectory_log is not None:
             self.trajectory_log.begin_batch(seed=self.seed, update=self.update_count+1,
@@ -335,9 +339,13 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                         ('controls','controls'), ('actions','sampled_actions')):
                         context[name][t] = np.stack([row[source] for row in transitions])
                     context['dates'][t] = [row['date'] for row in transitions]
-                    if 'storage_constraints' in context:
-                        context['storage_constraints'][t] = np.stack(
-                            [row['storage_constraints'] for row in transitions])
+                    if 'terminal_target' in context:
+                        context['terminal_target'][t] = np.stack(
+                            [row['terminal_target'] for row in transitions])
+                        context['terminal_remaining_days'][t] = np.asarray(
+                            [row['terminal_remaining_days'] for row in transitions])
+                        context['terminal_forecast'][t] = np.stack(
+                            [row['terminal_forecast'] for row in transitions])
                 if self.trajectory_log is not None:
                     self.trajectory_log.capture(t, transitions)
                 done = np.array([r['done'] for r in results])

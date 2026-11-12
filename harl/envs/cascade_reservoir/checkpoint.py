@@ -555,7 +555,8 @@ class FrozenCascadePolicy:
             spill_by_reservoir_billion_m3=(spill_by/1e9).tolist(),
             initial_storage_m3=initial.tolist(), final_storage_m3=env.storage.tolist(),
             total_storage_depletion_billion_m3=float((initial-env.storage).sum()/1e9),
-            max_balance_residual_m3=residual, **feasible, **env.observation_metadata(),
+            max_balance_residual_m3=residual, terminal_objective=getattr(env, 'terminal_report', None),
+            **feasible, **env.observation_metadata(),
             **totals,
             reward_penalties=dict(env.reward_settings),
             action_overrides=[dict(episode_step=int(step), reservoir=name, action_index=int(index))

@@ -82,13 +82,17 @@ def synthetic_dispatch(*, head_model='fixed', bins=200, available_water=30.,
 
 def brute_grid(env, row, reservoir):
     actions = row['sampled_actions'].astype(float)/(env.action_bins-1)
+    terminal = None
+    if row.get('terminal_target') is not None:
+        terminal = dict(target=row['terminal_target'],
+            remaining_days=row['terminal_remaining_days'], forecast=row['terminal_forecast'])
     results = []
     for index in range(env.action_bins):
         candidate = actions.copy()
         candidate[reservoir] = index/(env.action_bins-1)
         results.append(env.physics.transition(row['storage_start'], row['external'],
             candidate, row['storage_lower_m3'], row['storage_upper_m3'],
-            storage_constraints=row.get('storage_constraints')))
+            terminal=terminal))
     return results
 
 
@@ -115,7 +119,7 @@ class DispatchFeasibilityTest(unittest.TestCase):
                     self.assertTrue(record['ecological_flow_release_limit_proven'])
                 json.dumps(records, allow_nan=False)
 
-    def test_terminal_reachability_is_preserved_by_diagnostic_witnesses(self):
+    def test_rolling_terminal_window_is_preserved_by_diagnostic_witnesses(self):
         physical = yaml.safe_load((ROOT/'harl/configs/envs_cfgs/cascade_reservoir.yaml').read_text())
         physical.update(head_model='fixed', terminal_storage_equal_initial=True)
         data = CascadeData(ROOT/'data/cascade_reservoir_new', physical)
@@ -131,11 +135,11 @@ class DispatchFeasibilityTest(unittest.TestCase):
                 np.testing.assert_allclose(record['ecological_flow_best_grid_actual'],
                     max(float(candidate['release'][i]) for candidate in expected), rtol=1e-10, atol=1e-7)
                 for candidate in expected:
-                    prefix = np.r_[0., np.cumsum(candidate['storage_end'])]
-                    self.assertTrue(np.all(prefix[:, None]-prefix[None, :] <= row['storage_constraints']+1e-3))
-                    if day == 3:
-                        np.testing.assert_allclose(candidate['storage_end'], initial, rtol=0., atol=1e-3)
-        np.testing.assert_allclose(env.storage, initial, rtol=0., atol=1e-3)
+                    np.testing.assert_allclose(candidate['storage_end']-candidate['storage_start'],
+                        (candidate['inflow']-candidate['release'])*86400., rtol=0., atol=1e-4)
+        self.assertIsNotNone(env.terminal_report)
+        np.testing.assert_allclose(env.terminal_report['deviation_m3'],
+                                   env.storage-initial, rtol=0., atol=1e-6)
 
     def test_all_station_grid_quantization_and_forced_release_limits(self):
         for i in range(5):

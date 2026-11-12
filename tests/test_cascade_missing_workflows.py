@@ -398,26 +398,25 @@ class InflowForecastObservationTest(unittest.TestCase):
             changed.external = np.zeros_like(self.data.external)
             np.testing.assert_array_equal(EpisodeData(changed, years, days).inflow_forecast, expected)
 
-    def test_forecast_only_changes_neither_critic_state_nor_fixed_command_physics(self):
+    def test_forecast_changes_only_actor_feature_and_terminal_scheduling(self):
         from harl.envs.cascade_reservoir.episodes import episode_environment
         changed = copy.copy(self.data)
         changed.inflow_forecast = self.data.inflow_forecast+10000.*np.arange(1., 6.)
         original = episode_environment(self.data, self.physical, [1965], days=4)
         altered = episode_environment(changed, self.physical, [1965], days=4)
+        np.testing.assert_array_equal(original.state(), altered.state())
+        np.testing.assert_array_equal(original.actor_observations()[:, :-1],
+                                      altered.actor_observations()[:, :-1])
+        self.assertTrue(np.all(original.actor_observations()[:, -1] !=
+                               altered.actor_observations()[:, -1]))
         for commands in (np.zeros(5), np.full(5, 99), np.array([3, 11, 45, 70, 90]), np.full(5, 48)):
-            np.testing.assert_array_equal(original.state(), altered.state())
-            np.testing.assert_array_equal(original.actor_observations()[:, :-1],
-                                          altered.actor_observations()[:, :-1])
-            self.assertTrue(np.all(original.actor_observations()[:, -1] != altered.actor_observations()[:, -1]))
             original.step(commands)
             altered.step(commands)
             left, right = original.last_transition, altered.last_transition
-            for field in ('external', 'inflow', 'storage_start', 'storage_end', 'release', 'turbine',
-                          'spill', 'power', 'energy', 'low', 'high', 'controls', 'local_rewards',
-                          'mixed_rewards', 'local_reward_penalties', 'storage_constraints'):
+            for field in ('external', 'terminal_target',
+                          'terminal_remaining_days'):
                 np.testing.assert_array_equal(left[field], right[field])
-            for field in ('reward', 'generation_reward', 'reward_penalty', 'global_reward', 'system_reward'):
-                self.assertEqual(left[field], right[field])
+            self.assertFalse(np.array_equal(left['terminal_forecast'], right['terminal_forecast']))
         np.testing.assert_array_equal(original.actor_observations(), np.zeros((5, 16), dtype=np.float32))
         np.testing.assert_array_equal(altered.actor_observations(), original.actor_observations())
         np.testing.assert_array_equal(original.state(), np.zeros(38, dtype=np.float32))

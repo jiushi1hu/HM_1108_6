@@ -56,9 +56,13 @@ class CounterfactualCreditTest(unittest.TestCase):
                 for key, source in dict(storage_start='storage_start', external='external',
                     actions='sampled_actions', storage_lower='storage_lower_m3',
                     storage_upper='storage_upper_m3', controls='controls').items()}
-            if 'storage_constraints' in records[0][0]:
-                context['storage_constraints'] = np.asarray([
-                    [row['storage_constraints'] for row in day] for day in records])
+            if 'terminal_target' in records[0][0]:
+                context['terminal_target'] = np.asarray([
+                    [row['terminal_target'] for row in day] for day in records])
+                context['terminal_remaining_days'] = np.asarray([
+                    [row['terminal_remaining_days'] for row in day] for day in records])
+                context['terminal_forecast'] = np.asarray([
+                    [row['terminal_forecast'] for row in day] for day in records])
             probabilities = np.stack([np.roll(np.arange(1.,6.), i) for i in range(5)])
             probabilities = np.broadcast_to(probabilities/15., (3,2,5,5)).copy()
             masks = np.ones((3,2,1)); masks[-1] = 0.
@@ -86,9 +90,14 @@ class CounterfactualCreditTest(unittest.TestCase):
                             for command in range(5):
                                 actions = row['sampled_actions'].astype(float)/4.
                                 actions[actor] = command/4.
+                                terminal = None
+                                if row.get('terminal_target') is not None:
+                                    terminal = dict(target=row['terminal_target'],
+                                        remaining_days=row['terminal_remaining_days'],
+                                        forecast=row['terminal_forecast'])
                                 transition = fixture['env'].physics.transition(row['storage_start'],
                                     row['external'], actions, row['storage_lower_m3'], row['storage_upper_m3'],
-                                    storage_constraints=row.get('storage_constraints'))
+                                    terminal=terminal)
                                 fixture['env'].operation_reward.apply(transition)
                                 value = 0.
                                 if step != 2:

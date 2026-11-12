@@ -129,7 +129,9 @@ def evaluate_policy(actors, data, physical_config, seed, episode, training_steps
         source_sequence='ordered source years; storage carries across every boundary; leap days retained',
         energy_MWh=energy, energy_TWh=energy/1e6, spill_volume_m3=spill,
         max_balance_residual_m3=residual, head_model=env.physics.head_model,
-        head_data_status=env.physics.head_data_status, **env.observation_metadata())
+        head_data_status=env.physics.head_data_status,
+        terminal_objective=getattr(env, 'terminal_report', None),
+        **env.observation_metadata())
     for i, name in enumerate(IDS):
         result[name+'_start_m3'] = float(initial[i])
         result[name+'_end_m3'] = float(env.storage[i])

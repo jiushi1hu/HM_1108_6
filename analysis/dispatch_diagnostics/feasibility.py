@@ -1,7 +1,7 @@
 """Observational ecological-release attainability from saved cascade states.
 
 One reservoir's command varies while the starting state, current inflows,
-next-state bounds, terminal reachability matrix and other sampled commands
+next-state bounds, rolling terminal scheduling inputs and other sampled commands
 remain fixed. Same-day alternatives do not establish a better multi-day policy
 or prove that a saved state was unavoidable.
 """
@@ -17,7 +17,7 @@ CLASSIFICATION_DEFINITIONS = {
     'same_state_release_limit': 'The maximum feasible release cannot meet the ecological requirement from the same saved state.',
 }
 SCOPE = ('one command changes; same starting storage, current forcing, next-state bounds, '
-         'terminal reachability constraints and other originally sampled commands; '
+         'rolling terminal scheduling inputs and other originally sampled commands; '
          'no additional forcing or trajectory changes')
 LIMITATION = ('Same-state restrictions do not prove exogenous or globally unavoidable failures. '
               'A meeting alternative may change other ecological releases and future storage; '
@@ -79,9 +79,14 @@ class _TransitionAnalysis:
         if key not in self.witnesses:
             actions = self.actions.copy()
             actions[i] = normalized
+            terminal = None
+            if self.row.get('terminal_target') is not None:
+                terminal = dict(target=self.row['terminal_target'],
+                    remaining_days=self.row['terminal_remaining_days'],
+                    forecast=self.row['terminal_forecast'])
             self.witnesses[key] = self.physics.transition(
                 self.row['storage_start'], self.row['external'], actions,
-                self.lower, self.upper, storage_constraints=self.row.get('storage_constraints'))
+                self.lower, self.upper, terminal=terminal)
         witness = self.witnesses[key]
         if not np.isclose(witness['release'][i], expected_release, rtol=1e-10, atol=1e-7):
             raise DispatchDiagnosticError('Release candidate disagrees with full cascade physics')
@@ -132,7 +137,8 @@ class _TransitionAnalysis:
         low, high = float(self.row['low'][i]), float(self.row['high'][i])
         if low > high+1e-8 or low < -1e-8:
             raise ValueError('Invalid feasible release interval')
-        forced = high-low <= 1e-8
+        infeasible = self.row.get('terminal_window_infeasible')
+        forced = high-low <= 1e-8 or (infeasible is not None and bool(infeasible[i]))
         releases = np.full(self.bins, actual) if forced else low+self.grid**2*(high-low)
         best = int(np.argmax(releases))
         witness = self.replay(i, float(self.grid[best]), float(releases[best]))
@@ -206,7 +212,7 @@ def analyze_transition(env, transition):
 
     Only violated requirements trigger alternative searches. Grid, maximum
     release and minimum-meeting witnesses execute full cascade physics with
-    the saved terminal reachability constraints and other commands fixed.
+    the saved rolling terminal scheduling inputs and other commands fixed.
     Diagnostic errors never classify the actual trajectory as infeasible.
     """
     try:
